@@ -470,6 +470,32 @@ check_failed_exploit_attempt() {
         "Failed exploit attempt (badpass origin, token_denied, no auth markers, anomalous pass= line)"
 }
 
+# Inspect a *.lock file (Cpanel::SafeFile dotlock) and confirm it looks
+# like a real lock before silently skipping it.
+#
+# Cpanel::Session uses Cpanel::SafeFile to write the session file to
+# disk (serialization itself is handled in the session code). SafeFile
+# creates a sibling dotlock at <session>.lock for the duration of every
+# write and, on crash/abort, may leave it behind permanently. The lock contents
+# are written by Cpanel::SafeFileLock::write_lock_contents as "$$\n$0\n"
+# - first line is the PID, second line is the program name. These are
+# not key=value pairs, so without a guard they trip
+# check_malformed_session_line as a CRITICAL false positive.
+#
+# The CVE-2026-41940 exploit vector is the session file content, not the
+# lock file, so a lock file that doesn't look right is not by itself an
+# exploitation indicator. Emit a stderr notice for operator awareness and
+# leave the SCAN SUMMARY counters alone.
+check_lock_file() {
+    local lock_file="$1"
+    local first_line
+    first_line=$(grep -m1 -v '^[[:space:]]*$' "$lock_file" 2>/dev/null)
+    if [[ "$first_line" =~ ^[0-9]+$ ]]; then
+        return
+    fi
+    echo "[NOTICE] Skipping unexpected .lock contents: $lock_file" >&2
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -477,6 +503,23 @@ check_failed_exploit_attempt() {
 scan_sessions() {
     local session_file
     while IFS= read -r -d '' session_file; do
+        # SafeFile dotlocks come in two forms: <session>.lock (the
+        # final lock) and <session>.lock-<hex-and-hyphens> (the temp
+        # name SafeFile writes before atomic-renaming into place; it
+        # can also be left behind on crash). Skip both.
+        #
+        # Vim creates a .swp swap file alongside any file it opens,
+        # so an operator inspecting a session in vim leaves one
+        # behind. The format is binary and not a session.
+        case "$session_file" in
+            *.lock | *.lock-*)
+                check_lock_file "$session_file"
+                continue
+                ;;
+            *.swp)
+                continue
+                ;;
+        esac
         check_token_denied_with_injected_token "$session_file"
         check_preauth_with_auth_attrs          "$session_file"
         check_tfa_with_bad_origin              "$session_file"
